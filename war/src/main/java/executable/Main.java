@@ -69,6 +69,12 @@ import java.util.jar.Manifest;
  * inappropriate Java Virtual Machine (JVM) or some other serious failure that would preclude
  * starting Winstone.
  *
+ * <p>구조적으로 보면 Winstone은 Jenkins 코어 자체가 아니라 Jenkins WAR를 실제 웹애플리케이션으로
+ * 띄워 주는 내장 서블릿 컨테이너 부트스트랩 역할. Main의 책임은 Winstone 실행 준비 역할로,
+ * Winstone은 WAR 전개, 웹루트 준비, 서블릿 컨텍스트 생성, 세션과 요청 처리 기반 수행.
+ * 그 다음 단계에서 web.xml 설정을 따라 WebAppMain.contextInitialized(...)가 호출되고,
+ * 이후 Jenkins 인스턴스 생성과 Init Reactor 초기화가 진행되는 연결 구조.
+ *
  * @author Kohsuke Kawaguchi
  */
 public class Main {
@@ -174,7 +180,15 @@ public class Main {
             value = "PATH_TRAVERSAL_IN",
             justification = "User provided values for running the program")
     public static void main(String[] args) throws IllegalAccessException {
+        /*
+         * java -jar jenkins.war 진입 직후의 최상위 부트스트랩 단계
+         * Jenkins 본체를 직접 띄우는 구현이 아니라 Winstone 실행 환경을 준비하고 위임하는 얇은 래퍼 역할
+         * 전체 흐름은 JVM 적합성 확인 -> 인자 정규화 -> WAR 실체 식별 -> 웹루트와 임시 추출 경로 준비 -> Winstone 추출 및 클래스 로딩 -> Winstone main 위임 순서
+         * 여기서 위임이 끝나면 이후 서블릿 컨테이너 초기화 과정에서 WebAppMain.contextInitialized(...)가 호출되고 그 다음 단계에서 Jenkins 인스턴스 초기화 진행
+         */
         try {
+            // 지원 대상 Java 버전 여부를 가장 먼저 확정하는 선행 방어 단계
+            // 지원 불가 JVM이면 Winstone 추출과 웹앱 초기화 비용을 지불하기 전에 즉시 종료하는 조기 차단 지점
             verifyJavaVersion(Runtime.version().feature(), isFutureJavaEnabled(args));
         } catch (UnsupportedClassVersionError e) {
             System.err.println(e.getMessage());
@@ -182,6 +196,8 @@ public class Main {
             System.exit(1);
         }
 
+        // 민감 인자를 프로세스 목록에 남기지 않기 위한 입력 우회 경로
+        // 이후 인자 처리 단계 전체가 stdin 기반 인자 배열을 기준으로 다시 진행되는 재구성 지점
         //Allows to pass arguments through stdin to "hide" sensitive parameters like httpsKeyStorePassword
         //to achieve this use --paramsFromStdIn
         if (hasArgument("--paramsFromStdIn", args)) {
@@ -198,10 +214,12 @@ public class Main {
         // This makes it easier to grab the version from a script
         final List<String> arguments = new ArrayList<>(List.of(args));
         if (arguments.contains("--version")) {
+            // 컨테이너 준비와 파일 추출 없이 즉시 반환하는 최단 경로
             System.out.println(getVersion("?"));
             return;
         }
 
+        // Winstone 및 기타 임시 파일 추출 위치를 외부에서 고정할 수 있게 하는 선택적 작업 디렉터리 수집 단계
         File extractedFilesFolder = null;
         for (String arg : args) {
             if (arg.startsWith("--extractedFilesFolder=")) {
@@ -213,6 +231,8 @@ public class Main {
             }
         }
 
+        // 플러그인 압축 해제 작업 디렉터리를 Jenkins 쪽 시스템 프로퍼티로 넘겨주는 초기 연결 단계
+        // 실제 플러그인 로딩은 훨씬 뒤 Jenkins 초기화 과정에서 수행되지만 그때 참조할 workDir을 여기서 선반영하는 준비 단계
         for (String arg : args) {
             if (arg.startsWith("--pluginroot=")) {
                 System.setProperty("hudson.PluginManager.workDir",
@@ -225,10 +245,14 @@ public class Main {
         // this is so that JFreeChart can work nicely even if we are launched as a daemon
         System.setProperty("java.awt.headless", "true");
 
+        // 현재 실행 중인 WAR 실체를 식별하는 기준점
+        // 이후 --warfile 인자 구성, 임시 추출 디렉터리 정리, Winstone 캐시 키 계산의 기준 파일 경로
         File me = whoAmI(extractedFilesFolder);
         System.out.println("Running from: " + me);
         System.setProperty("executable-war", me.getAbsolutePath());  // remember the location so that we can access it from within webapp
 
+        // Main 전용 옵션을 걷어내고 Winstone이 이해하는 인자 집합으로 변환하는 정규화 단계
+        // Jenkins 홈 기준 webroot 기본값을 보강하여 exploded WAR 리소스 위치를 안정적으로 확보하는 단계
         // figure out the arguments
         trimOffOurOptions(arguments);
         arguments.add(0, "--warfile=" + me.getAbsolutePath());
@@ -246,10 +270,14 @@ public class Main {
             deleteContentsFromFolder(extractedFilesFolder, "winstone.*\\.jar");
         }
 
+        // 내장 Winstone 런처 jar를 파일 시스템으로 추출하는 단계
+        // 이후 URLClassLoader가 물리 파일 경로를 기준으로 Winstone 클래스를 적재하기 위한 선행 조건
         // put winstone jar in a file system so that we can load jars from there
         File tmpJar = extractFromJar("winstone.jar", "winstone", ".jar", extractedFilesFolder);
         tmpJar.deleteOnExit();
 
+        // 이전 실행에서 남았을 수 있는 Winstone 임시 전개물을 제거하는 정리 단계
+        // Jenkins 버전 교체 이후 구버전 잔재가 섞여 로딩되는 상황을 줄이기 위한 방어 동작
         // clean up any previously extracted copy, since
         // winstone doesn't do so and that causes problems when newer version of Jenkins
         // is deployed.
@@ -264,6 +292,11 @@ public class Main {
             System.err.println("Failed to delete temporary file: " + tempFile);
         }
 
+        // 실제 부팅 주체인 Winstone 런처 클래스를 별도 클래스 로더로 적재하는 단계
+        // Winstone의 역할은 Jenkins 본체 실행이 아니라 Jenkins WAR를 수용할 내장 서블릿 컨테이너 제공 역할
+        // 이 지점 이후의 책임은 HTTP 리스너 준비, WAR 전개, 서블릿 컨텍스트 생성, web.xml 기반 초기화 시작 역할
+        // Jenkins 관점의 다음 진입점은 컨테이너 초기화 이후 호출되는 WebAppMain.contextInitialized(...) 지점
+        // Main은 여기까지가 역할, 이후부터는 서블릿 컨테이너 초기화 책임을 Winstone에 위임하는 구조
         // locate the Winstone launcher
         ClassLoader cl;
         try {
@@ -326,6 +359,8 @@ public class Main {
             }
         }
 
+        // 현재 스레드의 컨텍스트 클래스 로더를 Winstone 로더로 전환하는 위임 직전 단계
+        // 이 호출 이후부터는 Winstone이 서블릿 컨테이너를 기동하고 Jenkins 웹애플리케이션 초기화 흐름을 시작하는 구간
         // run
         Thread.currentThread().setContextClassLoader(cl);
         try {
@@ -385,6 +420,8 @@ public class Main {
      */
     @SuppressFBWarnings(value = {"PATH_TRAVERSAL_IN", "URLCONNECTION_SSRF_FD"}, justification = "User provided values for running the program.")
     public static File whoAmI(File directory) {
+        // 현재 Main.class가 실려 있는 아카이브 파일을 역으로 찾아 실제 실행 WAR 경로를 복원하는 식별 단계
+        // java -jar, JNLP 캐시, 임시 복사본 등 실행 매체 차이를 흡수하기 위한 자기 위치 해석 로직
         // JNLP returns the URL where the jar was originally placed (like http://jenkins-ci.org/...)
         // not the local cached file. So we need a rather round about approach to get to
         // the local file name.
@@ -397,6 +434,7 @@ public class Main {
         } catch (Exception x) {
             System.err.println("ZipFile.name trick did not work, using fallback: " + x);
         }
+        // 표준 경로 해석이 실패했을 때 코드소스 스트림을 임시 파일로 복제하여 실행 WAR 대체물을 확보하는 복구 경로
         File myself;
         try {
             myself = File.createTempFile("jenkins", ".jar", directory);
@@ -423,6 +461,7 @@ public class Main {
             throw new MissingResourceException("Unable to find the resource: " + resource, Main.class.getName(), resource);
         }
 
+        // 클래스패스 내부 리소스를 실제 파일로 전개하여 URLClassLoader와 외부 프로세스가 사용할 수 있게 만드는 추출 단계
         // put this jar in a file system so that we can load jars from there
         File tmp;
         try {
