@@ -85,6 +85,10 @@ import org.kohsuke.stapler.jelly.JellyFacet;
  *
  * @author Kohsuke Kawaguchi
  */
+
+// Hudson   : Jenkins의 기존 소프트웨어 명으로, 예전 이름과 API를 깨지 않기 위한 compatibility wrapper
+// Winstone : Jenkins WAR를 직접 실행할 수 있게 해주는 내장 웹 컨테이너 런처 (외부 Tomcat 없는 이유)
+// executable.Main이 Winstone에 위임 후 다음 단계의 젠킨스 진입점
 public class WebAppMain implements ServletContextListener {
 
     /**
@@ -139,6 +143,7 @@ public class WebAppMain implements ServletContextListener {
      */
     @Override
     public void contextInitialized(ServletContextEvent event) {
+        // 윈스턴이 web.xml과 리스너 구성 해석 후 호출하는 Jenkins 웹앱 초기 진입 메서드
         // Nicer console log formatting when using mvn jetty:run.
         if (Main.isDevelopmentMode && System.getProperty("java.util.logging.config.file") == null) {
             try {
@@ -155,11 +160,13 @@ public class WebAppMain implements ServletContextListener {
             }
         }
 
+        // 현재 프로세스가 컨트롤러 JVM임을 Jenkins 내부 유틸리티에 알리는 JVM 역할 표식 설정 단계
         JenkinsJVMAccess._setJenkinsJVM(true);
         final ServletContext context = event.getServletContext();
         File home = null;
         try {
 
+            // 요청 스레드 Locale을 Jenkins 전역 Locale 공급자에 연결하여 초기 화면과 메시지 해석 기준을 맞추는 준비 단계
             // use the current request to determine the language
             LocaleProvider.setProvider(new LocaleProvider() {
                 @Override
@@ -168,6 +175,7 @@ public class WebAppMain implements ServletContextListener {
                 }
             });
 
+            // 보안 관리자와 클래스 로딩 권한이 최소한의 기동 조건을 만족하는지 확인하는 선행 방어 단계
             // quick check to see if we (seem to) have enough permissions to run. (see JENKINS-719)
             JVM jvm;
             try {
@@ -183,8 +191,10 @@ public class WebAppMain implements ServletContextListener {
                 // ignore this error.
             }
 
+            // 부팅 초반부터 Jenkins 전용 링버퍼 로그 핸들러를 설치하여 실패 이전 로그까지 수집 가능하게 만드는 단계
             installLogger();
 
+            // JENKINS_HOME 결정과 디렉터리 실체 확보 단계
             final FileAndDescription describedHomeDir = getHomeDir(event);
             home = describedHomeDir.file.getAbsoluteFile();
             try {
@@ -194,8 +204,10 @@ public class WebAppMain implements ServletContextListener {
             }
             LOGGER.info("Jenkins home directory: " + home + " found at: " + describedHomeDir.description);
 
+            // 이번 부팅 시도를 기록하여 반복 부팅 실패 분석과 복구 화면 판단에 활용하는 진단 정보 축적 단계
             recordBootAttempt(home);
 
+            // XStream 반사 구현, 서블릿 API, Ant, AWT, 임시 디렉터리 등 핵심 런타임 전제 조건을 확인하는 호환성 검증 단계
             // make sure that we are using XStream in the "enhanced" (JVM-specific) mode
             if (jvm.bestReflectionProvider().getClass() == PureJavaReflectionProvider.class) {
                 throw new IncompatibleVMDetected(); // nope
@@ -233,36 +245,47 @@ public class WebAppMain implements ServletContextListener {
                 throw new NoTempDir(e);
             }
 
+            // Jelly 표현식 팩토리와 뷰 레이어 초기화 기반을 먼저 심어 두는 화면 렌더링 준비 단계
             installExpressionFactory(event);
 
+            // 아직 Jenkins 인스턴스가 준비되지 않았음을 외부에 알리는 로딩 상태 게시 단계
+            // 초기 요청은 이 상태 객체를 통해 로딩 화면과 대기 동작을 보게 되는 구조
             context.setAttribute(APP, new HudsonIsLoading());
             if (SystemProperties.getBoolean(FORCE_SESSION_TRACKING_BY_COOKIE_PROP, true)) {
                 context.setSessionTrackingModes(EnumSet.of(SessionTrackingMode.COOKIE));
             }
 
             final File _home = home;
+            // 무거운 Jenkins 본체 초기화를 컨테이너 시작 스레드와 분리하여 수행하는 비동기 초기화 단계
+            // 실제 Jenkins 생성자는 Hudson(_home, context)이며 내부에서 Jenkins 생성과 Init Reactor 진행 구조
             initThread = new Thread("Jenkins initialization thread") {
                 @Override
                 public void run() {
                     boolean success = false;
                     try {
+                        // Jenkins 싱글턴 생성과 핵심 서브시스템 초기화가 시작되는 실질적 부팅 진입점
                         Jenkins instance = new Hudson(_home, context);
 
                         // one last check to make sure everything is in order before we go live
                         if (Thread.interrupted())
                             throw new InterruptedException();
 
+                        // 로딩 상태 객체를 실제 Jenkins 인스턴스로 교체하여 정상 요청 처리를 개시하는 상태 전이 단계
                         context.setAttribute(APP, instance);
 
+                        // 부팅 성공 시 이전에 남긴 실패 추적 파일을 제거하는 정리 단계
                         Files.deleteIfExists(BootFailure.getBootFailureFile(_home).toPath());
 
+                        // Lifecycle 훅을 통해 외부 세계에 서비스 준비 완료를 알리는 최종 개시 단계
                         // at this point we are open for business and serving requests normally
                         Jenkins.get().getLifecycle().onReady();
                         success = true;
                     } catch (Error e) {
+                        // 복구 불가능 수준 오류를 실패 화면으로 게시하고 다시 전파하는 치명 오류 처리 경로
                         new HudsonFailedToLoad(e).publish(context, _home);
                         throw e;
                     } catch (Exception e) {
+                        // 예외 사슬 내부 BootFailure 구현체를 우선 존중하여 맞춤형 실패 화면을 허용하는 복구 가능 오류 처리 경로
                         // Allow plugins to override error page on boot with custom BootFailure subclass thrown
                         Throwable error = unwrapException(e);
                         if (error instanceof InvocationTargetException) {
@@ -277,6 +300,7 @@ public class WebAppMain implements ServletContextListener {
                             new HudsonFailedToLoad(e).publish(context, _home);
                         }
                     } finally {
+                        // 부분 초기화된 Jenkins 인스턴스가 남아 있을 경우 리소스 정리를 강제하는 실패 후처리 단계
                         Jenkins instance = Jenkins.getInstanceOrNull();
                         if (!success && instance != null)
                             instance.cleanUp();
