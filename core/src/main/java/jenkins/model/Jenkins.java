@@ -351,10 +351,16 @@ import org.xml.sax.InputSource;
  *
  * @author Kohsuke Kawaguchi
  */
+
+// webAppMain이 올려놓은 환경 위에 실제 Jenkins 본체를 구성하는 핵심 오브젝트
+// webAppMain은 컨테이너 진입점, 사전 검증, 로딩 상태 게시 역할
+// 위 클래스는 플러그인 준비, 전역 설정 등의 기동을 묶어 실행
+// Jenkins 부팅 시퀀스 전체를 오케스트레이션하는 중심 객체
 @ExportedBean
 public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLevelItemGroup, StaplerProxy, StaplerFallback,
         ModifiableViewGroup, AccessControlled, DescriptorByNameOwner,
         ModelObjectWithContextMenu, ModelObjectWithChildren, OnMaster, Loadable {
+    // 기본저긍로 Queue 기반으로 Job 실행
     private final transient Queue queue;
 
     // flag indicating if we have loaded the jenkins configuration or not yet.
@@ -396,11 +402,14 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
     /**
      * Number of executors of the built-in node.
      */
+    // Master-Agent로 노드 분리하여 쓸거면 0으로 맞춰줘야 함
     private int numExecutors = 2;
 
     /**
      * Job allocation strategy.
      */
+    // Normal : 일반 모드 (라벨 없는 일반 잡도 노드에서 돌 수 있음)
+    // Exclusive : 전용 모드로, 이 노드와 맞는 라벨을 명시적으로 지정한 잡만 여기서 돌림
     private Mode mode = Mode.NORMAL;
 
     /**
@@ -897,12 +906,19 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
         "DM_EXIT" // Exit is wanted here
     })
     protected Jenkins(File root, ServletContext context, PluginManager pluginManager) throws IOException, InterruptedException, ReactorException {
+        /*
+         * WebAppMain 초기화 스레드에서 호출되는 Jenkins 본체 생성자
+         * 단순 필드 초기화 생성자가 아니라 싱글턴 수립, 버전 계산, 플러그인 매니저 연결, Stapler 웹앱 보안 필터 설정,
+         * 비밀키와 프록시 구성 로드, Init Reactor 실행, 후속 런타임 서비스 기동까지 포함하는 실질 부팅 본체 단계
+         * 이 생성자가 반환되는 시점은 핵심 초기화가 완료되어 ServletContext의 로딩 상태를 실제 Jenkins 인스턴스로 교체할 수 있는 시점
+         */
         oldJenkinsJVM = JenkinsJVM.isJenkinsJVM(); // capture to restore in cleanUp()
         JenkinsJVMAccess._setJenkinsJVM(true); // set it for unit tests as they will not have gone through WebAppMain
         long start = System.currentTimeMillis();
         STARTUP_MARKER_FILE = new FileBoolean(new File(root, ".lastStarted"));
         // As Jenkins is starting, grant this process full control
         try (ACLContext ctx = ACL.as2(ACL.SYSTEM2)) {
+            // 루트 디렉터리, 서블릿 컨텍스트, 전역 싱글턴 등록을 먼저 확정하는 본체 정착 단계
             this.root = root;
             this.jakartaServletContext = context;
             this.servletContext = ServletContextWrapper.fromJakartServletContext(context);
@@ -956,6 +972,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
                 pluginManager = PluginManager.createDefault(this);
             this.pluginManager = pluginManager;
             WebApp webApp = WebApp.get(getServletContext());
+            // Stapler 웹앱이 플러그인 클래스와 Jenkins 보안 필터를 이해하도록 연결하는 웹 계층 결선 단계
             // JSON binding needs to be able to see all the classes from all the plugins
             webApp.setClassLoader(pluginManager.uberClassLoader);
             webApp.setJsonInErrorMessageSanitizer(RedactSecretJsonInErrorMessageSanitizer.INSTANCE);
@@ -981,6 +998,9 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
             // Sanity check that we can load the confidential store. Fail fast if we can't.
             ConfidentialStore.get();
 
+            // Jenkins 초기화의 핵심 본체 단계
+            // 플러그인 준비 태스크, 설정/잡 로드 태스크, milestone 강제 순서를 하나의 Reactor 그래프로 합성하여 실행하는 구조
+            // 이후 개별 @Initializer와 loadTasks() 태스크가 milestone 제약에 따라 실행되는 연결 구조
             // initialization consists of ...
             executeReactor(is,
                     pluginManager.initTasks(is),    // loading and preparing plugins
@@ -1005,6 +1025,8 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
                 System.exit(0);
             save();
 
+            // Reactor 완료 이후에야 가능한 후속 런타임 서비스 기동 단계
+            // inbound agent 리스너, 라벨 정리 타이머, 내장 노드 online 이벤트, item loaded 이벤트가 이 구간에서 개시되는 구조
             launchTcpSlaveAgentListener();
 
             Timer.get().scheduleAtFixedRate(new SafeTimerTask() {
@@ -1132,6 +1154,11 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
      *      If non-null, this can be consulted for ignoring some tasks. Only used during the initialization of Jenkins.
      */
     private void executeReactor(final InitStrategy is, TaskBuilder... builders) throws IOException, InterruptedException, ReactorException {
+        /*
+         * Jenkins 초기화 태스크 그래프를 실제로 실행하는 오케스트레이션 메서드
+         * pluginManager.initTasks(...), loadTasks(), InitMilestone.ordering()에서 만들어진 TaskBuilder들을 Reactor로 합성하는 단계
+         * 개별 태스크 실행 자체보다 milestone 진척 관리, 예외 전파, SYSTEM 권한 컨텍스트 부여, 초기화 타임아웃 연장 같은 운영 제어 역할
+         */
         Reactor reactor = new Reactor(builders) {
             /**
              * Sets the thread name to the task for better diagnostics.
@@ -1146,6 +1173,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
                 String name = t.getName();
                 if (taskName != null)
                     t.setName(taskName);
+                // 초기화 태스크는 아직 보안 모델이 완전히 올라오기 전 구간이므로 SYSTEM 권한으로 실행되는 부트스트랩 태스크 실행 구간
                 try (ACLContext ctx = ACL.as2(ACL.SYSTEM2)) { // full access in the initialization thread
                     long start = System.currentTimeMillis();
                     super.runTask(task);
@@ -1175,6 +1203,8 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
         new InitReactorRunner() {
             @Override
             protected void onInitMilestoneAttained(InitMilestone milestone) {
+                // Init Reactor가 milestone을 통과할 때마다 현재 초기화 레벨과 라이프사이클 타임아웃을 갱신하는 진행 상황 반영 단계
+                // PLUGINS_PREPARED 시점에는 ExtensionFinder 로딩을 강제하여 이후 확장 검색이 실제로 동작할 준비를 맞추는 연결 단계
                 initLevel = milestone;
                 getLifecycle().onExtendTimeout(EXTEND_TIMEOUT_SECONDS, TimeUnit.SECONDS);
                 if (milestone == PLUGINS_PREPARED) {
@@ -3461,6 +3491,11 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
     }
 
     private synchronized TaskBuilder loadTasks() throws IOException {
+        /*
+         * 전역 설정과 개별 job 디렉터리를 Reactor 태스크로 변환하는 로드 그래프 생성 메서드
+         * 여기서 바로 load를 순차 실행하는 구조가 아니라 TaskGraphBuilder에 전역 설정 로드, item 로드, 정리, 최종 보정 단계를 태스크로 적재하는 구조
+         * executeReactor(...)가 이 반환값을 plugin 초기화 태스크와 합쳐 전체 부팅 그래프의 일부로 실행하는 연결 관계
+         */
         File projectsDir = new File(root, "jobs");
         if (!projectsDir.getCanonicalFile().isDirectory() && !projectsDir.mkdirs()) {
             if (projectsDir.exists())
@@ -3473,6 +3508,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
 
         TaskGraphBuilder g = new TaskGraphBuilder();
         Handle loadJenkins = g.requires(EXTENSIONS_AUGMENTED).attains(SYSTEM_CONFIG_LOADED).add("Loading global config", session -> {
+            // 전역 config.xml과 노드 구성을 메모리 객체로 복원하는 시스템 설정 로드 단계
             load();
             // if we are loading old data that doesn't have this field
             if (slaves != null && !slaves.isEmpty() && nodes.isLegacy()) {
@@ -3486,6 +3522,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
         List<Handle> loadJobs = new ArrayList<>();
         for (final File subdir : subdirs) {
             loadJobs.add(g.requires(loadJenkins).requires(SYSTEM_CONFIG_ADAPTED).attains(JOB_LOADED).notFatal().add("Loading item " + subdir.getName(), session -> {
+                // 각 job 디렉터리의 config.xml을 TopLevelItem 객체로 역직렬화하는 개별 item 복원 단계
                 if (!Items.getConfigFile(subdir).exists()) {
                     //Does not have job config file, so it is not a jenkins job hence skip it
                     return;
@@ -3497,6 +3534,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
         }
 
         g.requires(loadJobs.toArray(new Handle[0])).attains(JOB_LOADED).add("Cleaning up obsolete items deleted from the disk", reactor -> {
+            // 디스크에서 사라진 item을 메모리 맵에서 제거하여 메모리 상태와 파일시스템 상태를 다시 동기화하는 정합성 복구 단계
             // anything we didn't load from disk, throw them away.
             // doing this after loading from disk allows newly loaded items
             // to inspect what already existed in memory (in case of reloading)
@@ -3510,6 +3548,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
         });
 
         g.requires(JOB_CONFIG_ADAPTED).attains(COMPLETED).add("Finalizing set up", session -> {
+            // 모든 설정 로드 이후 의존 그래프 재계산, 라벨 재구성, 보안 기본값 보정, RootAction 자동 등록, 설치 상태 초기화를 수행하는 최종 정착 단계
             rebuildDependencyGraph();
 
             { // recompute label objects - populates the labels mapping.
@@ -3559,6 +3598,11 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
      */
     @Override
     public synchronized void save() throws IOException {
+        /*
+         * Jenkins 전역 config.xml 저장 메서드
+         * 단순 직렬화 호출이 아니라 초기화 milestone과 configLoaded 상태를 확인하여 너무 이른 저장을 차단하는 보호 장치 역할
+         * 초기화가 완료된 뒤에만 현재 실행 버전을 config.xml에 반영하고 SaveableListener까지 발화하는 전역 설정 영속화 관문 역할
+         */
         InitMilestone currentMilestone = initLevel;
 
         if (!configLoaded) {
@@ -3610,6 +3654,11 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
      * Called to shut down the system.
      */
     public void cleanUp() {
+        /*
+         * Jenkins 종료 또는 부팅 실패 후 정리 단계의 최상위 메서드
+         * 중복 cleanUp 호출을 차단하고 종료 상태를 전파한 뒤, 실행 중인 작업 종료, 컴퓨터 연결 해제, 타이머와 트리거 중단,
+         * TCP agent 리스너 종료, 필터와 확장 정리, 싱글턴 해제까지 순차 정리하는 종료 오케스트레이션 역할
+         */
         if (theInstance != this && theInstance != null) {
             LOGGER.log(Level.WARNING, "This instance is no longer the singleton, ignoring cleanUp()");
             return;
