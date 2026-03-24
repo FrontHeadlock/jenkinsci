@@ -52,6 +52,15 @@ import org.jvnet.hudson.reactor.Task;
  * methods, those methods have to be on a class annotated with {@link Extension} and marked as
  * {@link #after()} {@link InitMilestone#PLUGINS_PREPARED}.
  *
+ * <p>실행 흐름 관점에서 보면 이 애노테이션은 "이 메서드를 Jenkins 부팅 Reactor 안의 태스크로 취급하라"는
+ * 선언 계약 역할이다. InitMilestone은 초기화 단계 경계표 역할이고,
+ * 이 애노테이션은 특정 메서드가 어떤 milestone 이후에 실행 가능하며 어떤 milestone 달성에 기여하는지를
+ * 메타데이터 형태로 기술하는 역할이다.
+ *
+ * <p>즉 실제 실행 순서를 직접 구현 코드로 적는 구조가 아니라,
+ * 메서드에 부착된 선언 정보인 after/before/requires/attains/fatal을
+ * InitializerFinder가 읽어 Reactor Task로 변환하는 연결 구조이다.
+ *
  * @author Kohsuke Kawaguchi
  */
 @Indexed
@@ -66,6 +75,7 @@ public @interface Initializer {
      * This has the identical purpose as {@link #requires()}, but it's separated to allow better type-safety
      * when using {@link InitMilestone} as a requirement (since enum member definitions need to be constant).
      */
+    // 이 초기화 메서드가 실행되기 전에 반드시 도달해야 하는 대표 milestone 선언 슬롯
     InitMilestone after() default STARTED;
 
     /**
@@ -75,11 +85,14 @@ public @interface Initializer {
      * This has the identical purpose as {@link #attains()}. See {@link #after()} for why there are two things
      * to achieve the same goal.
      */
+    // 이 초기화 메서드 완료가 특정 milestone 달성의 일부 조건임을 나타내는 대표 milestone 선언 슬롯
     InitMilestone before() default COMPLETED;
 
     /**
      * Indicates the milestones necessary before executing this initializer.
      */
+    // 문자열 기반 추가 선행 milestone 선언 슬롯
+    // enum에 없는 사용자 정의 milestone 이름까지 표현할 수 있도록 열어 둔 확장 지점
     String[] requires() default {};
 
     /**
@@ -88,12 +101,15 @@ public @interface Initializer {
      * A milestone is considered attained if all the initializers that attains the given milestone
      * completes. So it works as a kind of join.
      */
+    // 문자열 기반 추가 기여 milestone 선언 슬롯
+    // 여러 초기화 메서드가 같은 milestone 달성에 합류하는 조인 지점 표현 역할
     String[] attains() default {};
 
     /**
      * Key in {@code Messages.properties} that represents what this task is about. Used for rendering the progress.
      * Defaults to "${short class name}.${method Name}".
      */
+    // 초기화 진행 화면과 로그에 표시될 태스크 이름 커스터마이징 슬롯
     String displayName() default "";
 
     /**
@@ -101,5 +117,6 @@ public @interface Initializer {
      *
      * @see Task#failureIsFatal()
      */
+    // 이 초기화 태스크 실패를 부팅 중단 사유로 승격할지 여부를 정하는 치명도 선언 슬롯
     boolean fatal() default true;
 }
